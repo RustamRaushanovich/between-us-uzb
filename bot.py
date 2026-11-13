@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ai_generator import generate_auto_post
+
 BASE_DIR = Path(__file__).resolve().parent
 QUEUE_DIR = BASE_DIR / "queue"
 MORNING_DIR = BASE_DIR / "morning_queue"
@@ -245,6 +247,7 @@ def record_subscriber_count(bot: TelegramBot) -> int | None:
 
 def run_scheduled_post(
     bot: TelegramBot,
+    gemini_key: str,
     morning_hour: int,
     hourly_start: int,
     hourly_end: int,
@@ -262,11 +265,13 @@ def run_scheduled_post(
 
     target_folder: Path | None = None
     slot: str = ""
+    mode: str = "hourly"
     default_caption = "@Between_Us_uzb"
 
     if hour == night_hour and minute >= night_minute:
         slot = now.strftime("%Y-%m-%d-23-09")
         target_folder = NIGHT_DIR
+        mode = "night"
         default_caption = (
             "Xayrli tun... Kuningizdagi barcha charchoqlar ortda qolsin. "
             "Tuningiz osuda, qalbingiz esa sokin bo'lsin. 🌙✨🤍\n\n"
@@ -275,6 +280,7 @@ def run_scheduled_post(
     elif hour == morning_hour:
         slot = now.strftime("%Y-%m-%d-%H")
         target_folder = MORNING_DIR
+        mode = "morning"
         default_caption = (
             "Xayrli tong! Yangi kunni tabassum va yaxshi kayfiyat bilan boshlang. "
             "Bugungi kuningiz fayzli va iliq lahzalarga boy bo'lsin! ☀️🤍\n\n"
@@ -283,6 +289,7 @@ def run_scheduled_post(
     elif hourly_start <= hour <= hourly_end:
         slot = now.strftime("%Y-%m-%d-%H")
         target_folder = QUEUE_DIR
+        mode = "hourly"
 
     if target_folder is None or not slot:
         return
@@ -291,16 +298,28 @@ def run_scheduled_post(
         return
 
     items = get_items_in(target_folder)
-    if not items and target_folder in {MORNING_DIR, NIGHT_DIR}:
-        # Fallback to regular queue if morning_queue or night_queue is empty
-        items = get_items_in(QUEUE_DIR)
-        target_folder = QUEUE_DIR
-
-    if not items:
-        return
 
     try:
-        result = publish_from_folder(bot, target_folder, items[0][0].name, default_caption)
+        if items:
+            result = publish_from_folder(bot, target_folder, items[0][0].name, default_caption)
+        else:
+            img_path, caption = generate_auto_post(gemini_key, mode, slot)
+            sent = bot.send_photo(bot.channel_id, img_path, caption=caption)
+            log = load_log()
+            log["posted_items"].append(
+                {
+                    "timestamp": now_iso(),
+                    "file": img_path.name,
+                    "source_folder": f"auto_{mode}",
+                    "message_id": sent.get("message_id"),
+                    "caption": caption,
+                }
+            )
+            save_log(log)
+            if img_path.parent.name == "generated" and img_path.exists():
+                img_path.unlink()
+            result = f"AI avto-post joylandi! (message_id: {sent.get('message_id')})"
+
         log = load_log()
         log["last_posted_slot"] = slot
         save_log(log)
@@ -309,7 +328,7 @@ def run_scheduled_post(
         print(f"[{now_iso()}] Avto-post xatosi ({slot}): {exc}")
 
 
-def handle_private_command(bot: TelegramBot, msg: dict) -> None:
+def handle_private_command(bot: TelegramBot, msg: dict, gemini_key: str = "") -> None:
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
     text = (msg.get("text") or "").strip()
@@ -337,6 +356,7 @@ def handle_private_command(bot: TelegramBot, msg: dict) -> None:
                 "/stats — Obunachilar va navbat holati\n"
                 "/preview — Navbatdagi rasm va postni ko'rish\n"
                 "/post_next — Navbatdagi postni darhol chiqarish\n"
+                "/test_ai — AI orqali yangi rasm va matn sinab ko'rish\n"
                 "/auto_on — Avto-post (06:00, har soat, 23:09) ni yoqish\n"
                 "/auto_off — Avto-postni to'xtatish"
             ),
@@ -393,6 +413,17 @@ def handle_private_command(bot: TelegramBot, msg: dict) -> None:
             ]
         }
         bot.send_photo(chat_id, img_path, caption=caption, reply_markup=keyboard)
+    elif text.startswith("/test_ai"):
+        bot.send_message(chat_id, "AI orqali yangi rasm va lotincha matn yaratilyapti...")
+        try:
+            img_path, caption = generate_auto_post(
+                gemini_key, "hourly", now_tashkent().strftime("%Y%m%d_%H%M%S")
+            )
+            bot.send_photo(chat_id, img_path, caption=caption)
+            if img_path.parent.name == "generated" and img_path.exists():
+                img_path.unlink()
+        except Exception as exc:
+            bot.send_message(chat_id, f"AI sinovida xato: {exc}")
     elif text.startswith("/post_next"):
         items = get_items_in(QUEUE_DIR)
         if not items:
@@ -495,6 +526,7 @@ def main() -> None:
     token = get_setting("BOT_TOKEN", env)
     channel_id = get_setting("CHANNEL_ID", env, "@Between_Us_uzb")
     admin_user_id = get_setting("ADMIN_USER_ID", env)
+    gemini_key = get_setting("GEMINI_API_KEY", env)
     check_interval = int(get_setting("CHECK_INTERVAL_SECONDS", env, "3600"))
     morning_hour = int(get_setting("MORNING_HOUR", env, "6"))
     hourly_start = int(get_setting("HOURLY_START_HOUR", env, "7"))
@@ -535,7 +567,7 @@ def main() -> None:
                 last_stat_check = now
 
             run_scheduled_post(
-                bot, morning_hour, hourly_start, hourly_end, night_hour, night_minute
+                bot, gemini_key, morning_hour, hourly_start, hourly_end, night_hour, night_minute
             )
 
             updates = bot.get_updates(offset=offset, timeout=25)
@@ -545,7 +577,7 @@ def main() -> None:
                 if "callback_query" in upd:
                     handle_callback(bot, upd["callback_query"])
                 elif "message" in upd and upd["message"].get("chat", {}).get("type") == "private":
-                    handle_private_command(bot, upd["message"])
+                    handle_private_command(bot, upd["message"], gemini_key)
         except KeyboardInterrupt:
             print("\nBot to'xtatildi.")
             break
