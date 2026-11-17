@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ai_generator import generate_auto_post
+from ai_generator import generate_auto_post, generate_caption
 
 BASE_DIR = Path(__file__).resolve().parent
 QUEUE_DIR = BASE_DIR / "queue"
@@ -25,6 +25,7 @@ ENV_FILE = BASE_DIR / ".env"
 
 TASHKENT_TZ = timezone(timedelta(hours=5))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+PENDING_MANUAL: dict[str, dict] = {}
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -123,17 +124,47 @@ class TelegramBot:
             raise RuntimeError(f"Telegram API error on sendPhoto: {result}")
         return result["result"]
 
+    def send_photo_by_id(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        caption: str = "",
+    ) -> dict:
+        return self._request(
+            "sendPhoto",
+            {"chat_id": chat_id, "photo": file_id, "caption": caption},
+        )
+
+    def send_video_by_id(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        caption: str = "",
+    ) -> dict:
+        return self._request(
+            "sendVideo",
+            {"chat_id": chat_id, "video": file_id, "caption": caption},
+        )
+
     def answer_callback(self, callback_query_id: str, text: str = "") -> None:
         self._request(
             "answerCallbackQuery",
             {"callback_query_id": callback_query_id, "text": text},
         )
 
-    def edit_caption(self, chat_id: int | str, message_id: int, caption: str) -> None:
-        self._request(
-            "editMessageCaption",
-            {"chat_id": chat_id, "message_id": message_id, "caption": caption},
-        )
+    def edit_text_or_caption(
+        self, chat_id: int | str, message_id: int, text: str, is_caption: bool = False
+    ) -> None:
+        if is_caption:
+            self._request(
+                "editMessageCaption",
+                {"chat_id": chat_id, "message_id": message_id, "caption": text},
+            )
+        else:
+            self._request(
+                "editMessageText",
+                {"chat_id": chat_id, "message_id": message_id, "text": text},
+            )
 
     def get_subscriber_count(self) -> int:
         return int(self._request("getChatMemberCount", {"chat_id": self.channel_id}))
@@ -144,6 +175,15 @@ class TelegramBot:
             payload["offset"] = offset
         return self._request("getUpdates", payload, timeout=timeout + 10)
 
+    def download_file(self, file_id: str, dest_path: Path) -> Path:
+        file_info = self._request("getFile", {"file_id": file_id})
+        file_path = file_info["file_path"]
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            dest_path.write_bytes(resp.read())
+        return dest_path
+
     def is_admin(self, user_id: int | str) -> bool:
         return bool(self.admin_user_id) and str(user_id) == self.admin_user_id
 
@@ -152,6 +192,7 @@ def load_log() -> dict:
     default = {
         "auto_post_enabled": True,
         "last_posted_slot": "",
+        "delayed_posts": [],
         "subscriber_history": [],
         "posted_items": [],
         "channel_posts": [],
@@ -249,12 +290,11 @@ def run_scheduled_post(
     bot: TelegramBot,
     gemini_key: str,
     morning_hour: int,
-    hourly_start: int,
-    hourly_end: int,
+    post_hours: set[int],
     night_hour: int,
     night_minute: int,
 ) -> None:
-    """Check Tashkent time and auto-post at 06:00, every hour, and 23:09 (Good Night)."""
+    """Check Tashkent time and auto-post at 06:00, configured POST_HOURS, and 23:09."""
     log = load_log()
     if not log.get("auto_post_enabled", True):
         return
@@ -286,7 +326,7 @@ def run_scheduled_post(
             "Bugungi kuningiz fayzli va iliq lahzalarga boy bo'lsin! ☀️🤍\n\n"
             "@Between_Us_uzb"
         )
-    elif hourly_start <= hour <= hourly_end:
+    elif hour in post_hours:
         slot = now.strftime("%Y-%m-%d-%H")
         target_folder = QUEUE_DIR
         mode = "hourly"
@@ -301,7 +341,13 @@ def run_scheduled_post(
 
     try:
         if items:
-            result = publish_from_folder(bot, target_folder, items[0][0].name, default_caption)
+            img_file, txt_file = items[0]
+            fallback_cap = (
+                default_caption
+                if txt_file
+                else generate_caption(gemini_key, mode, "cozy romantic couple moment")
+            )
+            result = publish_from_folder(bot, target_folder, img_file.name, fallback_cap)
         else:
             img_path, caption = generate_auto_post(gemini_key, mode, slot)
             sent = bot.send_photo(bot.channel_id, img_path, caption=caption)
@@ -326,6 +372,63 @@ def run_scheduled_post(
         print(f"[{now_iso()}] Avto-post ({slot}): {result}")
     except Exception as exc:
         print(f"[{now_iso()}] Avto-post xatosi ({slot}): {exc}")
+
+
+def publish_manual_item(bot: TelegramBot, item: dict) -> str:
+    """Publish a photo, video, or text message sent by admin to the channel."""
+    kind = item["type"]
+    caption = item.get("caption", "")
+    if kind == "photo":
+        sent = bot.send_photo_by_id(bot.channel_id, item["file_id"], caption=caption)
+    elif kind == "video":
+        sent = bot.send_video_by_id(bot.channel_id, item["file_id"], caption=caption)
+    else:
+        sent = bot.send_message(bot.channel_id, caption, parse_mode="")
+
+    log = load_log()
+    log["posted_items"].append(
+        {
+            "timestamp": now_iso(),
+            "file": f"manual_{kind}",
+            "source_folder": "manual",
+            "message_id": sent.get("message_id"),
+            "caption": caption,
+        }
+    )
+    save_log(log)
+    return f"Kanalga joylandi! (message_id: {sent.get('message_id')})"
+
+
+def process_delayed_posts(bot: TelegramBot) -> None:
+    """Publish any manual posts whose scheduled delay time has arrived."""
+    log = load_log()
+    delayed = log.get("delayed_posts", [])
+    if not delayed:
+        return
+
+    now_ts = time.time()
+    remaining: list[dict] = []
+    changed = False
+
+    for entry in delayed:
+        if now_ts >= entry.get("publish_at", 0):
+            changed = True
+            try:
+                res = publish_manual_item(bot, entry)
+                print(f"[{now_iso()}] Kechiktirilgan post chiqarildi: {res}")
+                if bot.admin_user_id:
+                    bot.send_message(bot.admin_user_id, f"✅ Rejalashtirilgan post: {res}")
+            except Exception as exc:
+                print(f"[{now_iso()}] Kechiktirilgan post xatosi: {exc}")
+                if bot.admin_user_id:
+                    bot.send_message(bot.admin_user_id, f"❌ Kechiktirilgan post xatosi: {exc}")
+        else:
+            remaining.append(entry)
+
+    if changed:
+        log = load_log()
+        log["delayed_posts"] = remaining
+        save_log(log)
 
 
 def handle_private_command(bot: TelegramBot, msg: dict, gemini_key: str = "") -> None:
@@ -357,14 +460,62 @@ def handle_private_command(bot: TelegramBot, msg: dict, gemini_key: str = "") ->
                 "/preview — Navbatdagi rasm va postni ko'rish\n"
                 "/post_next — Navbatdagi postni darhol chiqarish\n"
                 "/test_ai — AI orqali yangi rasm va matn sinab ko'rish\n"
-                "/auto_on — Avto-post (06:00, har soat, 23:09) ni yoqish\n"
-                "/auto_off — Avto-postni to'xtatish"
+                "/auto_on — Avto-post (06:00, 10:00, 14:00, 17:00, 20:00, 23:09) ni yoqish\n"
+                "/auto_off — Avto-postni to'xtatish\n\n"
+                "💡 <b>Qo'shimcha post:</b> Menga rasm, video yoki matn yuborsangiz — "
+                "darhol yoki 10–60 daqiqadan keyin chiqarishni so'rayman."
             ),
         )
         return
 
     if not bot.is_admin(user_id):
         bot.send_message(chat_id, "Ruxsat yo'q.")
+        return
+
+    if msg.get("photo") or msg.get("video") or (text and not text.startswith("/")):
+        if msg.get("photo"):
+            kind = "photo"
+            file_id = msg["photo"][-1]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+        elif msg.get("video"):
+            kind = "video"
+            file_id = msg["video"]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+        else:
+            kind = "text"
+            file_id = ""
+            caption = text
+
+        item_id = uuid.uuid4().hex[:8]
+        PENDING_MANUAL[item_id] = {
+            "type": kind,
+            "file_id": file_id,
+            "caption": caption,
+        }
+        rows = [
+            [
+                {"text": "🚀 Hozir joylash", "callback_data": f"mnow:{item_id}"},
+                {"text": "⏳ 10 daq", "callback_data": f"mdelay:{item_id}:10"},
+                {"text": "⏳ 15 daq", "callback_data": f"mdelay:{item_id}:15"},
+            ],
+            [
+                {"text": "⏳ 20 daq", "callback_data": f"mdelay:{item_id}:20"},
+                {"text": "⏳ 30 daq", "callback_data": f"mdelay:{item_id}:30"},
+                {"text": "⏳ 45 daq", "callback_data": f"mdelay:{item_id}:45"},
+            ],
+            [
+                {"text": "⏳ 60 daq", "callback_data": f"mdelay:{item_id}:60"},
+                {"text": "❌ Bekor qilish", "callback_data": f"mcancel:{item_id}"},
+            ],
+        ]
+        if kind == "photo":
+            rows[2].insert(1, {"text": "📥 Navbatga", "callback_data": f"mqueue:{item_id}"})
+
+        bot.send_message(
+            chat_id,
+            "Qachon kanalga chiqaray?",
+            reply_markup={"inline_keyboard": rows},
+        )
         return
 
     if text.startswith("/stats"):
@@ -450,13 +601,73 @@ def handle_callback(bot: TelegramBot, cb: dict) -> None:
             result = publish_from_folder(bot, QUEUE_DIR, filename)
             bot.answer_callback(cb["id"], "Kanalga chiqarildi!")
             if chat_id and message_id:
-                bot.edit_caption(chat_id, message_id, f"✅ {result}")
+                bot.edit_text_or_caption(chat_id, message_id, f"✅ {result}", is_caption=True)
         except Exception as exc:
             bot.answer_callback(cb["id"], f"Xato: {exc}")
     elif data.startswith("cancel:"):
         bot.answer_callback(cb["id"], "Bekor qilindi.")
         if chat_id and message_id:
-            bot.edit_caption(chat_id, message_id, "❌ Kanalga chiqarish bekor qilindi.")
+            bot.edit_text_or_caption(
+                chat_id, message_id, "❌ Kanalga chiqarish bekor qilindi.", is_caption=True
+            )
+    elif data.startswith("mnow:"):
+        item_id = data.split(":", 1)[1]
+        item = PENDING_MANUAL.pop(item_id, None)
+        if not item:
+            bot.answer_callback(cb["id"], "Muddati o'tgan yoki topilmadi.")
+            return
+        try:
+            result = publish_manual_item(bot, item)
+            bot.answer_callback(cb["id"], "Kanalga chiqarildi!")
+            if chat_id and message_id:
+                bot.edit_text_or_caption(chat_id, message_id, f"✅ {result}")
+        except Exception as exc:
+            bot.answer_callback(cb["id"], f"Xato: {exc}")
+    elif data.startswith("mdelay:"):
+        _, item_id, mins_str = data.split(":", 2)
+        item = PENDING_MANUAL.pop(item_id, None)
+        if not item:
+            bot.answer_callback(cb["id"], "Muddati o'tgan yoki topilmadi.")
+            return
+        mins = int(mins_str)
+        entry = {**item, "publish_at": time.time() + mins * 60}
+        log = load_log()
+        log["delayed_posts"].append(entry)
+        save_log(log)
+        bot.answer_callback(cb["id"], f"{mins} daqiqadan keyin chiqariladi!")
+        if chat_id and message_id:
+            bot.edit_text_or_caption(
+                chat_id, message_id, f"⏳ {mins} daqiqadan keyin kanalga chiqariladi."
+            )
+    elif data.startswith("mqueue:"):
+        item_id = data.split(":", 1)[1]
+        item = PENDING_MANUAL.pop(item_id, None)
+        if not item or item.get("type") != "photo":
+            bot.answer_callback(cb["id"], "Topilmadi.")
+            return
+        stamp = now_tashkent().strftime("%Y%m%d_%H%M%S")
+        img_dest = QUEUE_DIR / f"tg_{stamp}.jpg"
+        try:
+            bot.download_file(item["file_id"], img_dest)
+            cap = item.get("caption", "").strip()
+            if cap:
+                if "@Between_Us_uzb" not in cap:
+                    cap = f"{cap}\n\n@Between_Us_uzb"
+                img_dest.with_suffix(".txt").write_text(cap, encoding="utf-8")
+            total = len(get_items_in(QUEUE_DIR))
+            bot.answer_callback(cb["id"], "Navbatga qo'shildi!")
+            if chat_id and message_id:
+                bot.edit_text_or_caption(
+                    chat_id, message_id, f"📥 Navbatga qo'shildi! (Jami: {total} ta)"
+                )
+        except Exception as exc:
+            bot.answer_callback(cb["id"], f"Xato: {exc}")
+    elif data.startswith("mcancel:"):
+        item_id = data.split(":", 1)[1]
+        PENDING_MANUAL.pop(item_id, None)
+        bot.answer_callback(cb["id"], "Bekor qilindi.")
+        if chat_id and message_id:
+            bot.edit_text_or_caption(chat_id, message_id, "❌ Bekor qilindi.")
 
 
 def log_update_activity(update: dict) -> None:
@@ -529,8 +740,8 @@ def main() -> None:
     gemini_key = get_setting("GEMINI_API_KEY", env)
     check_interval = int(get_setting("CHECK_INTERVAL_SECONDS", env, "3600"))
     morning_hour = int(get_setting("MORNING_HOUR", env, "6"))
-    hourly_start = int(get_setting("HOURLY_START_HOUR", env, "7"))
-    hourly_end = int(get_setting("HOURLY_END_HOUR", env, "22"))
+    post_hours_raw = get_setting("POST_HOURS", env, "10,14,17,20")
+    post_hours = {int(h.strip()) for h in post_hours_raw.split(",") if h.strip().isdigit()}
     night_hour = int(get_setting("NIGHT_HOUR", env, "23"))
     night_minute = int(get_setting("NIGHT_MINUTE", env, "9"))
 
@@ -551,10 +762,11 @@ def main() -> None:
     if port_str:
         start_health_server(int(port_str))
 
+    hours_label = ",".join(f"{h:02d}:00" for h in sorted(post_hours))
     print(
         f"[{now_iso()}] Between Us Bot ishga tushdi. "
         f"Kanal: {channel_id} | Tonggi: {morning_hour:02d}:00 | "
-        f"Soatlik: {hourly_start:02d}:00-{hourly_end:02d}:00 | Tungi: {night_hour:02d}:{night_minute:02d}"
+        f"Kunduzgi: {hours_label} | Tungi: {night_hour:02d}:{night_minute:02d}"
     )
     offset: int | None = None
     last_stat_check = 0.0
@@ -566,8 +778,9 @@ def main() -> None:
                 record_subscriber_count(bot)
                 last_stat_check = now
 
+            process_delayed_posts(bot)
             run_scheduled_post(
-                bot, gemini_key, morning_hour, hourly_start, hourly_end, night_hour, night_minute
+                bot, gemini_key, morning_hour, post_hours, night_hour, night_minute
             )
 
             updates = bot.get_updates(offset=offset, timeout=25)
