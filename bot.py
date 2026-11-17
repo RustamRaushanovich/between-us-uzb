@@ -146,6 +146,39 @@ class TelegramBot:
             {"chat_id": chat_id, "video": file_id, "caption": caption},
         )
 
+    def send_audio_by_id(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        caption: str = "",
+    ) -> dict:
+        return self._request(
+            "sendAudio",
+            {"chat_id": chat_id, "audio": file_id, "caption": caption},
+        )
+
+    def send_voice_by_id(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        caption: str = "",
+    ) -> dict:
+        return self._request(
+            "sendVoice",
+            {"chat_id": chat_id, "voice": file_id, "caption": caption},
+        )
+
+    def send_document_by_id(
+        self,
+        chat_id: int | str,
+        file_id: str,
+        caption: str = "",
+    ) -> dict:
+        return self._request(
+            "sendDocument",
+            {"chat_id": chat_id, "document": file_id, "caption": caption},
+        )
+
     def answer_callback(self, callback_query_id: str, text: str = "") -> None:
         self._request(
             "answerCallbackQuery",
@@ -375,13 +408,19 @@ def run_scheduled_post(
 
 
 def publish_manual_item(bot: TelegramBot, item: dict) -> str:
-    """Publish a photo, video, or text message sent by admin to the channel."""
+    """Publish a photo, video, audio, voice, document, or text sent by admin."""
     kind = item["type"]
     caption = item.get("caption", "")
     if kind == "photo":
         sent = bot.send_photo_by_id(bot.channel_id, item["file_id"], caption=caption)
     elif kind == "video":
         sent = bot.send_video_by_id(bot.channel_id, item["file_id"], caption=caption)
+    elif kind == "audio":
+        sent = bot.send_audio_by_id(bot.channel_id, item["file_id"], caption=caption)
+    elif kind == "voice":
+        sent = bot.send_voice_by_id(bot.channel_id, item["file_id"], caption=caption)
+    elif kind == "document":
+        sent = bot.send_document_by_id(bot.channel_id, item["file_id"], caption=caption)
     else:
         sent = bot.send_message(bot.channel_id, caption, parse_mode="")
 
@@ -472,7 +511,8 @@ def handle_private_command(bot: TelegramBot, msg: dict, gemini_key: str = "") ->
         bot.send_message(chat_id, "Ruxsat yo'q.")
         return
 
-    if msg.get("photo") or msg.get("video") or (text and not text.startswith("/")):
+    has_media = any(msg.get(k) for k in ("photo", "video", "audio", "voice", "document"))
+    if has_media or (text and not text.startswith("/")):
         if msg.get("photo"):
             kind = "photo"
             file_id = msg["photo"][-1]["file_id"]
@@ -480,6 +520,18 @@ def handle_private_command(bot: TelegramBot, msg: dict, gemini_key: str = "") ->
         elif msg.get("video"):
             kind = "video"
             file_id = msg["video"]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+        elif msg.get("audio"):
+            kind = "audio"
+            file_id = msg["audio"]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+        elif msg.get("voice"):
+            kind = "voice"
+            file_id = msg["voice"]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+        elif msg.get("document"):
+            kind = "document"
+            file_id = msg["document"]["file_id"]
             caption = (msg.get("caption") or "").strip()
         else:
             kind = "text"
